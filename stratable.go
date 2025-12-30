@@ -7,11 +7,45 @@ import (
 	"time"
 )
 
-// PreStartCallback is a function that is called before starting.
-// If it returns false, the start process is aborted.
-type PreStartCallback func() bool
+/*
+========================
+ Types
+========================
+*/
+
+// PreStartCallback is called before start.
+// Returning an error aborts startup.
+type PreStartCallback func() error
+
+// StartFunction is the main execution function.
+// It should return when ctx is cancelled.
 type StartFunction func(ctx context.Context) any
+
+// PostStartCallback is called after StartFunction exits.
 type PostStartCallback func(any)
+
+type StartableState int
+
+const (
+	Idle StartableState = iota
+	Starting
+	Running
+	Stopping
+	Stopped
+)
+
+var (
+	ErrAlreadyStarted = errors.New("already started")
+	ErrNotStarted     = errors.New("not started")
+	// ErrPreStartFailed = errors.New("pre-start failed")
+	ErrStopTimeout    = errors.New("stop timeout exceeded")
+)
+
+/*
+========================
+ Startable
+========================
+*/
 
 type Startable struct {
 	mtx sync.Mutex
@@ -25,70 +59,48 @@ type Startable struct {
 
 	state StartableState
 
-	endSig   chan struct{}
 	startSig chan struct{}
+	endSig   chan struct{}
 }
 
-type StartableState int
+/*
+========================
+ Configuration
+========================
+*/
 
-const (
-	Idle     StartableState = iota
-	Starting                // pre + start not completed
-	Running                 // start function executing
-	Stopping
-	Stopped
-)
-
-var (
-	ErrAlreadyStarted = errors.New("already started")
-	ErrNotStarted     = errors.New("not started")
-	// ErrStopTimeout is returned when StopWithTimeout exceeds the given duration
-	ErrStopTimeout = errors.New("stop timeout exceeded")
-)
-
-// SetPreStartCallback sets the pre-start callback.
 func (s *Startable) SetPreStartCallback(cb PreStartCallback) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if !s.isIdle() {
+	if s.state != Idle && s.state != Stopped {
 		return
 	}
 	s.pre = cb
 }
 
-// SetStartFunction sets the start function.
 func (s *Startable) SetStartFunction(fn StartFunction) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if !s.isIdle() {
+	if s.state != Idle && s.state != Stopped {
 		return
 	}
 	s.start = fn
 }
 
-// SetPostStartCallback sets the post-start callback.
 func (s *Startable) SetPostStartCallback(cb PostStartCallback) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if !s.isIdle() {
+	if s.state != Idle && s.state != Stopped {
 		return
 	}
 	s.post = cb
 }
 
-// IsActive reports whether the Startable is running sequence or not.
-func (s *Startable) IsActive() bool {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	return !s.isIdle()
-}
-
-// IsRunning reports whether the Startable is on Running state or not.
-func (s *Startable) IsRunning() bool {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	return s.state == Running
-}
+/*
+========================
+ State helpers
+========================
+*/
 
 func (s *Startable) State() StartableState {
 	s.mtx.Lock()
@@ -96,106 +108,126 @@ func (s *Startable) State() StartableState {
 	return s.state
 }
 
-func (s *Startable) isIdle() bool {
-	return s.state == Idle || s.state == Stopped
+// IsStarted reports whether the Startable is in running state or not.
+func (s *Startable) IsRunning() bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.state == Running
+}
+// IsActive reports whether the Startable is running sequence or not.
+func (s *Startable) IsActive() bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.state != Idle && s.state != Stopped {
+		return true
+	}
+	return false
 }
 
-// Start initializes and runs the Startable.
-// if ctx is nil it will use background context
+/*
+========================
+ Lifecycle
+========================
+*/
+
 func (s *Startable) Start(ctx context.Context) error {
 	s.mtx.Lock()
-	if !s.isIdle() {
+	if s.state != Idle && s.state != Stopped {
 		s.mtx.Unlock()
 		return ErrAlreadyStarted
 	}
 
-	if ctx == nil {
-		ctx = context.Background()
+	parent := ctx
+	if parent == nil {
+		parent = context.Background()
 	}
-	s.ctx, s.cancel = context.WithCancel(ctx)
-	s.endSig = make(chan struct{})
+
+	s.ctx, s.cancel = context.WithCancel(parent)
 	s.startSig = make(chan struct{})
+	s.endSig = make(chan struct{})
 	s.state = Starting
 
 	pre := s.pre
-	post := s.post
 	start := s.start
-
-	var out any
+	post := s.post
 
 	s.mtx.Unlock()
 
 	go func() {
-		// Run pre-start
+		defer func() {
+			s.mtx.Lock()
+			s.state = Stopped
+			close(s.endSig)
+			s.mtx.Unlock()
+		}()
+
+		// Pre-start
 		if pre != nil {
-			if pre() == false {
+			if err := pre(); err != nil {
 				close(s.startSig)
-				goto end
+				return
 			}
 		}
 
+		// Running
 		s.mtx.Lock()
 		s.state = Running
 		s.mtx.Unlock()
-
 		close(s.startSig)
-		// Run main start function
 
+		var out any
 		if start != nil {
 			out = start(s.ctx)
 		}
 
+		// Stopping
 		s.mtx.Lock()
 		s.state = Stopping
 		s.mtx.Unlock()
 
-		// Run post-start
 		if post != nil {
 			post(out)
 		}
-
-	end:
-		// Mark as stopped
-		s.mtx.Lock()
-		s.state = Stopped
-		close(s.endSig)
-		s.mtx.Unlock()
 	}()
 
 	return nil
 }
 
+/*
+========================
+ Synchronization
+========================
+*/
 // WaitForFullStart blocks until the Startable has fully started.
 // It returns true if the Startable started successfully, or false if it stopped before starting.
 // if the Startable is not running, it returns false immediately.
 // if the Startable is already started, it returns true immediately.
 // if duration is non-zero, it will wait for that duration only.
-func (s *Startable) WaitForFullStart(duration time.Duration) bool {
+func (s *Startable) WaitForFullStart(d time.Duration) bool {
 	s.mtx.Lock()
-	if s.isIdle() {
+	if s.state == Idle || s.state == Stopped {
 		s.mtx.Unlock()
 		return false
 	}
+	startSig := s.startSig
 	s.mtx.Unlock()
 
-	if duration == 0 {
-		<-s.startSig
+	if d == 0 {
+		<-startSig
 		return s.IsRunning()
-
 	}
+
 	select {
-	case <-s.startSig:
-		// started
+	case <-startSig:
 		return s.IsRunning()
-	case <-time.After(duration):
+	case <-time.After(d):
 		return false
 	}
 }
 
-// Stop cancels the running Startable.
 func (s *Startable) Stop() error {
 	s.mtx.Lock()
-	if s.isIdle() {
+	if s.state == Idle || s.state == Stopped {
 		s.mtx.Unlock()
 		return ErrNotStarted
 	}
@@ -208,10 +240,9 @@ func (s *Startable) Stop() error {
 	return nil
 }
 
-// StopWithTimeout attempts to stop the Startable, but returns an error if it doesn't stop within d.
 func (s *Startable) StopWithTimeout(d time.Duration) error {
 	s.mtx.Lock()
-	if s.isIdle() {
+	if s.state == Idle || s.state == Stopped {
 		s.mtx.Unlock()
 		return ErrNotStarted
 	}
@@ -219,10 +250,8 @@ func (s *Startable) StopWithTimeout(d time.Duration) error {
 	endSig := s.endSig
 	s.mtx.Unlock()
 
-	// Cancel the context
 	cancel()
 
-	// Wait for either endSig or timeout
 	select {
 	case <-endSig:
 		return nil
