@@ -153,18 +153,22 @@ func (s *Startable) Start(ctx context.Context) error {
 
 	s.mtx.Unlock()
 
+	closeStartSgFn := sync.OnceFunc(func(){
+		close(s.startSig)
+	})
+
 	go func() {
 		defer func() {
 			s.mtx.Lock()
 			s.state = Stopped
 			close(s.endSig)
+			closeStartSgFn()
 			s.mtx.Unlock()
 		}()
 
 		// Pre-start
 		if pre != nil {
 			if err := pre(); err != nil {
-				close(s.startSig)
 				return
 			}
 		}
@@ -173,7 +177,7 @@ func (s *Startable) Start(ctx context.Context) error {
 		s.mtx.Lock()
 		s.state = Running
 		s.mtx.Unlock()
-		close(s.startSig)
+		closeStartSgFn()
 
 		var out any
 		if start != nil {
